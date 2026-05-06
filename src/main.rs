@@ -3,7 +3,6 @@ use cryptoki::context::Pkcs11;
 use cryptoki::context::CInitializeArgs;
 use cryptoki::mechanism::Mechanism;
 use cryptoki::mechanism::MechanismInfo;
-use cryptoki::mechanism::MechanismType;
 use cryptoki::object::Attribute;
 use cryptoki::object::AttributeType;
 use cryptoki::session::Session;
@@ -23,11 +22,46 @@ use cryptoki::object::ObjectHandle;
 use cryptoki::session::UserType;
 use cryptoki::types::AuthPin;
 use cryptoki::object::ObjectClass;
+use cryptoki_sys::{CKR_OK, CK_MECHANISM_TYPE, CK_ULONG};
 use clap::Parser;
+use std::cell::RefCell;
 use std::env;
+use std::mem;
 
 static STRICT: bool = false;
 
+#[derive(Default)]
+struct TestSummary {
+    pass: usize,
+    fail: usize,
+}
+
+thread_local! {
+    static TEST_SUMMARY: RefCell<TestSummary> = RefCell::new(TestSummary::default());
+}
+
+fn reset_test_summary() {
+    TEST_SUMMARY.with(|summary| *summary.borrow_mut() = TestSummary::default());
+}
+
+fn report_status(status: &str) {
+    TEST_SUMMARY.with(|summary| {
+        let mut summary = summary.borrow_mut();
+        match status {
+            "PASS" => summary.pass += 1,
+            "FAIL" => summary.fail += 1,
+            _ => (),
+        }
+    });
+    println!("{status}");
+}
+
+fn print_test_summary() {
+    TEST_SUMMARY.with(|summary| {
+        let summary = summary.borrow();
+        println!("\nSUMMARY PASS={} FAIL={}", summary.pass, summary.fail);
+    });
+}
 
 #[derive(Parser, Debug)]
 /// Run PKCS#11 conformance tests
@@ -76,7 +110,7 @@ fn limit_matches(l: &Limit, s: &String) -> bool {
 fn get_slot(slots: &Vec<Slot>, slot_id: &String, variables: &mut HashMap<String, String>) -> Option<Slot> {
     let actual_slotid = substitute_variable(slot_id, &"0".to_owned(), variables);
     for slot in slots {
-        if actual_slotid == slots[0].id().to_string() {
+        if actual_slotid == slot.id().to_string() {
             return Some(*slot);
         }
     }
@@ -158,7 +192,7 @@ fn substitute_variable(value: &String, actual_value: &String, variables: &mut Ha
 fn pkcs11_slots_matches(pkcs11_result: &Result<Vec<Slot>>,
     rv: &String,
     slotlist_length: &String,
-    slot_id: &String,
+    slot_id: &Option<String>,
     variables: &mut HashMap<String, String>) -> bool {
 
     match pkcs11_result {
@@ -166,10 +200,11 @@ fn pkcs11_slots_matches(pkcs11_result: &Result<Vec<Slot>>,
             let actual_slotlist_length = substitute_variable(slotlist_length, &slots.len().to_string(), variables);
             if rv == "OK"
                 && actual_slotlist_length == slots.len().to_string() {
-                    if slots.len() == 0 {
+                    if slots.len() == 0 || slot_id.is_none() {
                         true
                     } else {
-                        let actual_slotid = substitute_variable(slot_id, &slots[0].id().to_string(), variables);
+                        let expected_slot_id = slot_id.as_ref().unwrap();
+                        let actual_slotid = substitute_variable(expected_slot_id, &slots[0].id().to_string(), variables);
                         if actual_slotid == slots[0].id().to_string() {
                             true
                         } else {
@@ -193,6 +228,36 @@ fn pkcs11_slots_matches(pkcs11_result: &Result<Vec<Slot>>,
                 true
             }
         }
+    }
+}
+
+fn get_raw_mechanism_list(module: &str, slot: Slot) -> std::result::Result<Vec<CK_MECHANISM_TYPE>, String> {
+    unsafe {
+        let pkcs11_lib = cryptoki_sys::Pkcs11::new(module).map_err(|err| err.to_string())?;
+        let mut list = mem::MaybeUninit::uninit();
+        let rv = pkcs11_lib.C_GetFunctionList(list.as_mut_ptr());
+        if rv != CKR_OK {
+            return Err(format!("C_GetFunctionList returned 0x{rv:x}"));
+        }
+
+        let function_list = *(*list.as_ptr());
+        let get_mechanism_list = function_list
+            .C_GetMechanismList
+            .ok_or_else(|| "C_GetMechanismList function pointer is null".to_owned())?;
+
+        let mut mechanism_count: CK_ULONG = 0;
+        let rv = get_mechanism_list(slot.into(), std::ptr::null_mut(), &mut mechanism_count);
+        if rv != CKR_OK {
+            return Err(format!("C_GetMechanismList length query returned 0x{rv:x}"));
+        }
+
+        let mut mechanisms = vec![0; mechanism_count as usize];
+        let rv = get_mechanism_list(slot.into(), mechanisms.as_mut_ptr(), &mut mechanism_count);
+        if rv != CKR_OK {
+            return Err(format!("C_GetMechanismList returned 0x{rv:x}"));
+        }
+        mechanisms.truncate(mechanism_count as usize);
+        Ok(mechanisms)
     }
 }
 
@@ -450,7 +515,7 @@ fn pkcs11_sign_matches(pkcs11_result: &Result<Vec<u8>>,
     }
 }
 
-fn pkcs11_mechanism_list_matches(pkcs11_result: &Result<Vec<MechanismType>>,
+fn pkcs11_mechanism_list_matches(pkcs11_result: &std::result::Result<Vec<CK_MECHANISM_TYPE>, String>,
     rv: &String,
     mechanism: &Vec<Mechanism>) -> bool {
 
@@ -461,7 +526,7 @@ fn pkcs11_mechanism_list_matches(pkcs11_result: &Result<Vec<MechanismType>>,
                 for m in mechanism {
                     let mut found = false;
                     for t in types {
-                        if m.mechanism_type() == *t {
+                        if CK_MECHANISM_TYPE::from(m.mechanism_type()) == *t {
                             found = true;
                             break;
                         }
@@ -490,8 +555,8 @@ fn pkcs11_mechanism_list_matches(pkcs11_result: &Result<Vec<MechanismType>>,
 
 fn pkcs11_mechanism_info_matches(pkcs11_result: &Result<MechanismInfo>,
     rv: &String,
-    max_key_size: &String,
     min_key_size: &String,
+    max_key_size: &String,
     flags: &String) -> bool {
 
     match pkcs11_result {
@@ -566,7 +631,7 @@ fn run_test(test_case: &str, module: &str) {
     let mut variables: HashMap<String, String> = HashMap::new();
     let mut slots: Vec<Slot> = Vec::new();
     let mut slotlist_length = "1".to_owned();
-    let mut slot_id = "0".to_owned();
+    let mut slot_id: Option<String> = None;
     let mut slot_description = "".to_owned();
     let mut hardware_version = ("1".to_owned(), "0".to_owned());
     let mut firmware_version = ("1".to_owned(), "0".to_owned());
@@ -643,7 +708,7 @@ fn run_test(test_case: &str, module: &str) {
                         }
                     },
                     b"Info" => {
-                        if action == "C_GetSlotInfo result" {
+                        if action == "C_GetSlotInfo result" || action == "C_GetTokenInfo result" {
                             max_session_count = get_attribute(&e, "MaxSessionCount", "0");
                             session_count = get_attribute(&e, "SessionCount", "0");
                             max_rw_session_count = get_attribute(&e, "MaxRwSessionCount", "0");
@@ -654,6 +719,7 @@ fn run_test(test_case: &str, module: &str) {
                             free_public_memory = get_attribute(&e, "FreePublicMemory", "0");
                             free_private_memory = get_attribute(&e, "FreePrivateMemory", "0");
                             total_private_memory = get_attribute(&e, "TotalPrivateMemory", "0");
+                        } else if action == "C_GetMechanismInfo result" {
                             min_key_size = get_attribute(&e, "MinKeySize", "0");
                             max_key_size = get_attribute(&e, "MaxKeySize", "0");
                         }
@@ -744,9 +810,9 @@ fn run_test(test_case: &str, module: &str) {
                             pkcs11.push(p11);
                             if let Some(attribute) = e.try_get_attribute("rv").unwrap() {
                                 if attribute.value != pkcs11_result_to_bytes(&pkcs11_result) {
-                                    println!("FAIL");
+                                    report_status("FAIL");
                                 } else {
-                                    println!("PASS");
+                                    report_status("PASS");
                                 }
                             }
                             action = "";
@@ -775,9 +841,10 @@ fn run_test(test_case: &str, module: &str) {
                     },
                     b"SlotList" => {
                         slotlist_length = get_attribute(&e, "length", "1");
+                        slot_id = None;
                     },
                     b"SlotID" => {
-                        slot_id = get_attribute(&e, "value", "0");
+                        slot_id = Some(get_attribute(&e, "value", "0"));
                     },
                     b"SlotDescription" => {
                         slot_description = get_attribute(&e, "value", "");
@@ -921,7 +988,7 @@ fn run_test(test_case: &str, module: &str) {
                         } else if rv != "OK" {
                             status = "PASS";
                         }
-                        println!("{status}");
+                        report_status(status);
                         action = "";
                     },
                     b"C_CloseAllSessions" => {
@@ -944,7 +1011,7 @@ fn run_test(test_case: &str, module: &str) {
                         //} else {
                         //println!("FAIL");
                         //}
-                        println!("{status}");
+                        report_status(status);
                         action = "";
                     },
                     b"C_Finalize" => {
@@ -956,9 +1023,9 @@ fn run_test(test_case: &str, module: &str) {
                             let p11 = pkcs11.pop().unwrap();
                             p11.finalize();
                             if rv == "OK" {
-                                println!("PASS");
+                                report_status("PASS");
                             } else {
-                                println!("FAIL");
+                                report_status("FAIL");
                             }
                             action = "";
                         }
@@ -982,7 +1049,7 @@ fn run_test(test_case: &str, module: &str) {
                                 }
                             }
                         }
-                        println!("{status}");
+                        report_status(status);
                         action = "";
                     },
                     b"C_Logout" => {
@@ -996,7 +1063,7 @@ fn run_test(test_case: &str, module: &str) {
                                 }
                             }
                         }
-                        println!("{status}");
+                        report_status(status);
                         action = "";
                     },
                     b"Data" => {
@@ -1059,9 +1126,9 @@ fn run_test(test_case: &str, module: &str) {
                         if pkcs11_info_matches(&pkcs11_result, &rv,
                             &cryptoki_version, &manufacturer_id, &flags, &library_version,
                             &library_description) {
-                            println!("PASS");
+                            report_status("PASS");
                         } else {
-                            println!("FAIL");
+                            report_status("FAIL");
                         }
                         action = "";
                     },
@@ -1073,16 +1140,16 @@ fn run_test(test_case: &str, module: &str) {
                                 let pkcs11_get_slotlist_result = pkcs11[0].get_slots_with_token();
                                 if pkcs11_slots_matches(&pkcs11_get_slotlist_result, &rv, &slotlist_length, &slot_id, &mut variables) {
                                     slots = pkcs11_get_slotlist_result.unwrap();
-                                    println!("PASS");
+                                    report_status("PASS");
                                 } else {
-                                    println!("FAIL");
+                                    report_status("FAIL");
                                 }
                             } else {
                                 let pkcs11_result = pkcs11[0].get_all_slots();
                                 if pkcs11_slots_matches(&pkcs11_result, &rv, &slotlist_length, &slot_id, &mut variables) {
-                                    println!("PASS");
+                                    report_status("PASS");
                                 } else {
-                                    println!("FAIL");
+                                    report_status("FAIL");
                                 }
                             }
                             action = "";
@@ -1093,7 +1160,7 @@ fn run_test(test_case: &str, module: &str) {
                             action = "C_GetSlotInfo result";
                         } else {
                             let mut status = "FAIL";
-                            if let Some(slot) = get_slot(&slots, &slot_id, &mut variables) {
+                            if let Some(slot) = get_slot(&slots, slot_id.as_ref().unwrap_or(&"0".to_owned()), &mut variables) {
                                 let pkcs11_result = pkcs11[0].get_slot_info(slot);
                                 if pkcs11_slot_info_matches(&pkcs11_result, &rv,
                                     &slot_description, &manufacturer_id, &flags,
@@ -1101,7 +1168,7 @@ fn run_test(test_case: &str, module: &str) {
                                     status = "PASS";
                                 }
                             }
-                            println!("{status}");
+                            report_status(status);
                             action = "";
                         }
                     },
@@ -1110,7 +1177,7 @@ fn run_test(test_case: &str, module: &str) {
                             action = "C_GetTokenInfo result";
                         } else {
                             let mut status = "FAIL";
-                            if let Some(slot) = get_slot(&slots, &slot_id, &mut variables) {
+                            if let Some(slot) = get_slot(&slots, slot_id.as_ref().unwrap_or(&"0".to_owned()), &mut variables) {
                                 let pkcs11_result = pkcs11[0].get_token_info(slot);
                                 if pkcs11_token_info_matches(&pkcs11_result, &rv,
                                     &max_session_count,
@@ -1128,14 +1195,14 @@ fn run_test(test_case: &str, module: &str) {
                                     status = "PASS";
                                 }
                             }
-                            println!("{status}");
+                            report_status(status);
                             action = "";
                         }
                     },
                     b"C_OpenSession" => {
                         if action == "C_OpenSession" {
                             action = "C_OpenSession result";
-                        } else if let Some(slot) = get_slot(&slots, &slot_id, &mut variables) {
+                        } else if let Some(slot) = get_slot(&slots, slot_id.as_ref().unwrap_or(&"0".to_owned()), &mut variables) {
                             let mut status = "FAIL";
                             if flags.contains("RW_SESSION") {
                                 let pkcs11_result = pkcs11[0].open_rw_session(slot);
@@ -1150,7 +1217,7 @@ fn run_test(test_case: &str, module: &str) {
                                     status = "PASS";
                                 }
                             }
-                            println!("{status}");
+                            report_status(status);
                             action = "";
                         }
                     },
@@ -1166,12 +1233,12 @@ fn run_test(test_case: &str, module: &str) {
                                 let pkcs11_result = session[0].get_attributes(
                                     objects[0], &attribute_types);
                                 if pkcs11_get_attributes_matches(&pkcs11_result, &rv, &template) {
-                                    println!("PASS");
+                                    report_status("PASS");
                                 } else {
-                                    println!("FAIL");
+                                    report_status("FAIL");
                                 }
                             } else {
-                                println!("FAIL");
+                                report_status("FAIL");
                             }
                             action = "";
                         }
@@ -1184,12 +1251,12 @@ fn run_test(test_case: &str, module: &str) {
                                 let d = hex_to_bytes(data.as_str()).unwrap();
                                 let pkcs11_result = session[0].sign(&mechanism[0], objects[0], &d);
                                 if pkcs11_sign_matches(&pkcs11_result, &rv, &signature) {
-                                    println!("PASS");
+                                    report_status("PASS");
                                 } else {
-                                    println!("FAIL");
+                                    report_status("FAIL");
                                 }
                             } else {
-                                println!("FAIL");
+                                report_status("FAIL");
                             }
                             action = "";
                         }
@@ -1208,7 +1275,7 @@ fn run_test(test_case: &str, module: &str) {
                                     objects = pkcs11_result.unwrap();
                                 }
                             }
-                            println!("{status}");
+                            report_status(status);
                             action = "";
                         }
                     },
@@ -1217,13 +1284,13 @@ fn run_test(test_case: &str, module: &str) {
                             action = "C_GetMechanismList result";
                         } else {
                             let mut status = "FAIL";
-                            if let Some(slot) = get_slot(&slots, &slot_id, &mut variables) {
-                                let pkcs11_result = pkcs11[0].get_mechanism_list(slot);
+                            if let Some(slot) = get_slot(&slots, slot_id.as_ref().unwrap_or(&"0".to_owned()), &mut variables) {
+                                let pkcs11_result = get_raw_mechanism_list(module, slot);
                                 if pkcs11_mechanism_list_matches(&pkcs11_result, &rv, &mechanism) {
                                     status = "PASS";
                                 }
                             }
-                            println!("{status}");
+                            report_status(status);
                             action = "";
                         }
                     },
@@ -1232,12 +1299,12 @@ fn run_test(test_case: &str, module: &str) {
                             action = "C_GetMechanismInfo result";
                         } else {
                             let mut status = "FAIL";
-                            if let Some(slot) = get_slot(&slots, &slot_id, &mut variables) {
+                            if let Some(slot) = get_slot(&slots, slot_id.as_ref().unwrap_or(&"0".to_owned()), &mut variables) {
                                 let pkcs11_result = pkcs11[0].get_mechanism_info(slot, mechanism[0].mechanism_type());
                                 if pkcs11_mechanism_info_matches(&pkcs11_result, &rv, &min_key_size, &max_key_size, &flags) { status = "PASS";
                                 }
                             }
-                            println!("{status}");
+                            report_status(status);
                             action = "";
                         }
                     },
@@ -1255,6 +1322,8 @@ fn run_test(test_case: &str, module: &str) {
 
 fn main() {
     let args = Args::parse();
+
+    reset_test_summary();
 
     if args.tests.is_some() {
         for test in args.tests.unwrap().into_iter() {
@@ -1283,4 +1352,6 @@ fn main() {
         const EXT: &str = include_str!("test-cases/pkcs11-v3.1/mandatory/EXT-M-1-31.xml");
         run_test(EXT, &args.module);
     }
+
+    print_test_summary();
 }
