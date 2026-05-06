@@ -52,12 +52,13 @@
     <SlotID value="${SlotList.SlotID[0]}"/>
   </C_GetTokenInfo>
   <C_GetTokenInfo rv="OK">
-    <Info MaxSessionCount="0" SessionCount="0" MaxRwSessionCount="0" RwSessionCount="0" MaxPinLen="255" MinPinLen="4" TotalPublicMemory="0" FreePublicMemory="0" TotalPrivateMemory="0" FreePrivateMemory="0">
+    <!-- PIV tokens commonly use a 6-8 digit PIN and may not expose CKF_RNG or CKF_RESTORE_KEY_NOT_NEEDED. -->
+    <Info MaxSessionCount="0" SessionCount="0" MaxRwSessionCount="0" RwSessionCount="0" MaxPinLen="8" MinPinLen="6" TotalPublicMemory="0" FreePublicMemory="0" TotalPrivateMemory="0" FreePrivateMemory="0">
       <label value="token1                          "/>
       <ManufacturerID value="OASIS PKCS#11 TC                "/>
       <model value="v3.1            "/>
       <serialNumber value="0000000000000000"/>
-      <Flags value="RNG|LOGIN_REQUIRED|USER_PIN_INITIALIZED|RESTORE_KEY_NOT_NEEDED|TOKEN_INITIALIZED"/>
+      <Flags value="LOGIN_REQUIRED|USER_PIN_INITIALIZED|TOKEN_INITIALIZED"/>
       <HardwareVersion major="1" minor="0"/>
       <FirmwareVersion major="1" minor="0"/>
       <utcTime value="2020102811572500"/>
