@@ -53,11 +53,13 @@
   </C_GetTokenInfo>
   <C_GetTokenInfo rv="OK">
     <!-- PIV tokens commonly use a 6-8 digit PIN and may not expose CKF_RNG or CKF_RESTORE_KEY_NOT_NEEDED. -->
+    <!-- original <Info MaxSessionCount="0" SessionCount="0" MaxRwSessionCount="0" RwSessionCount="0" MaxPinLen="255" MinPinLen="4" TotalPublicMemory="0" FreePublicMemory="0" TotalPrivateMemory="0" FreePrivateMemory="0"> --> 
     <Info MaxSessionCount="0" SessionCount="0" MaxRwSessionCount="0" RwSessionCount="0" MaxPinLen="8" MinPinLen="6" TotalPublicMemory="0" FreePublicMemory="0" TotalPrivateMemory="0" FreePrivateMemory="0">
       <label value="token1                          "/>
       <ManufacturerID value="OASIS PKCS#11 TC                "/>
       <model value="v3.1            "/>
       <serialNumber value="0000000000000000"/>
+      <!-- original <Flags value="RNG|LOGIN_REQUIRED|USER_PIN_INITIALIZED|RESTORE_KEY_NOT_NEEDED|TOKEN_INITIALIZED"/> -->
       <Flags value="LOGIN_REQUIRED|USER_PIN_INITIALIZED|TOKEN_INITIALIZED"/>
       <HardwareVersion major="1" minor="0"/>
       <FirmwareVersion major="1" minor="0"/>
@@ -96,6 +98,8 @@
     <Type value="RSA_PKCS_KEY_PAIR_GEN"/>
   </C_GetMechanismInfo>
   <C_GetMechanismInfo rv="OK">
+    <!-- Adjusted to PIV supported keysize -->
+    <!-- original <Info MinKeySize="512" MaxKeySize="16384"> -->    
     <Info MinKeySize="2048" MaxKeySize="4096">
       <Flags value="GENERATE_KEY_PAIR"/>
     </Info>
@@ -105,6 +109,9 @@
     <Type value="RSA_PKCS"/>
   </C_GetMechanismInfo>
   <C_GetMechanismInfo rv="OK">
+    <!-- Adjusted to PIV supported keysize and flags-->
+    <!-- original <Info MinKeySize="512" MaxKeySize="16384"> -->
+    <!-- original <Flags value="ENCRYPT|DECRYPT|SIGN|VERIFY|WRAP|UNWRAP"/> -->
     <Info MinKeySize="2048" MaxKeySize="4096">
       <Flags value="SIGN"/>
     </Info>
