@@ -4,7 +4,7 @@
      14 July 2022
      Copyright (c) OASIS Open 2022. All Rights Reserved.
      Source: https://docs.oasis-open.org/pkcs11/pkcs11-profiles/v3.1/cs01/test-cases/
-     Latest version of narrative specification: https://docs.oasis-open.org/pkcs11/pkcs11-profiles/v3.1/pkcs11-profiles-v3.1.html
+     Latest version of narrative specification: https://docs.oasis-open.org/pkcs11/pkcs11-profiles-v3.1/pkcs11-profiles-v3.1.html
      TC IPR Statement: https://www.oasis-open.org/committees/pkcs11/ipr.php
 -->
 <PKCS11>
@@ -96,7 +96,7 @@
     <Type value="RSA_PKCS_KEY_PAIR_GEN"/>
   </C_GetMechanismInfo>
   <C_GetMechanismInfo rv="OK">
-    <Info MinKeySize="512" MaxKeySize="16384">
+    <Info MinKeySize="2048" MaxKeySize="4096">
       <Flags value="GENERATE_KEY_PAIR"/>
     </Info>
   </C_GetMechanismInfo>
@@ -105,8 +105,8 @@
     <Type value="RSA_PKCS"/>
   </C_GetMechanismInfo>
   <C_GetMechanismInfo rv="OK">
-    <Info MinKeySize="512" MaxKeySize="16384">
-      <Flags value="ENCRYPT|DECRYPT|SIGN|VERIFY|WRAP|UNWRAP"/>
+    <Info MinKeySize="2048" MaxKeySize="4096">
+      <Flags value="SIGN"/>
     </Info>
   </C_GetMechanismInfo>
   <C_OpenSession>
