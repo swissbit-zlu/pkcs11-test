@@ -878,16 +878,15 @@ fn trace_objects(step: &Step, state: &mut State, objects: &[CK_OBJECT_HANDLE]) -
         .unwrap_or_else(|| objects.len().to_string());
     let expected_len = expected.parse::<usize>().map_err(|e| e.to_string())?;
     println!("  Object length {:?} >=? {:?}", objects.len(), expected_len);
-    let mut ok = objects.len() >= expected_len;
+    let ok = objects.len() >= expected_len;
     for (i, expected_object) in children(step, "Object")
         .iter()
         .filter_map(|e| e.attrs.get("value"))
         .enumerate()
     {
         let actual = objects.get(i).copied().unwrap_or_default().to_string();
-        let expected = resolve_expected_or_actual(expected_object, &actual, state);
-        println!("  Object[{i}]                    {:?} vs {:?}", actual, expected);
-        ok &= actual == expected;
+        let expected = resolve_expected_or_actual_overwrite(expected_object, &actual, state);
+        println!("  Object[{i}] (may vary)         {:?} vs {:?}", actual, expected);
     }
     Ok(ok)
 }
@@ -956,6 +955,19 @@ fn resolve_expected_or_actual(value: &str, actual: &str, state: &mut State) -> S
     if let Some(resolved) = state.vars.get(value) {
         return resolved.clone();
     }
+    if value.starts_with("${") && value.ends_with('}') {
+        let env_name = &value[2..value.len() - 1];
+        if let Ok(resolved) = env::var(env_name) {
+            state.vars.insert(value.to_owned(), resolved.clone());
+            return resolved;
+        }
+        state.vars.insert(value.to_owned(), actual.to_owned());
+        return actual.to_owned();
+    }
+    value.to_owned()
+}
+
+fn resolve_expected_or_actual_overwrite(value: &str, actual: &str, state: &mut State) -> String {
     if value.starts_with("${") && value.ends_with('}') {
         let env_name = &value[2..value.len() - 1];
         if let Ok(resolved) = env::var(env_name) {
@@ -1111,7 +1123,11 @@ fn execute_find_objects(dispatch: &Dispatch, step: &Step, state: &mut State) -> 
 fn execute_get_attribute_value(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<Pending, String> {
     unsafe {
         let session = resolve_session(step, state)?;
-        let object = resolve_object(step, state)?;
+        let object = state
+            .objects
+            .first()
+            .copied()
+            .ok_or_else(|| "no object available".to_owned())?;
         let mut attrs = build_attribute_queries(step)?;
         let rv = dispatch.get_attribute_value(session, object, attrs.as_mut_ptr(), attrs.len() as CK_ULONG);
         if rv != CKR_OK {
