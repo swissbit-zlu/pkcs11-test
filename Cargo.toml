@@ -2,9 +2,14 @@
 name = "pkcs11-test"
 version = "0.1.0"
 edition = "2021"
-default-run = "pkcs11_test_v31"
+autobins = false
+default-run = "pkcs11-test"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "pkcs11-test"
+path = "src/bin/pkcs11_test_v31.rs"
 
 [[bin]]
 name = "pkcs11-test-legacy"
