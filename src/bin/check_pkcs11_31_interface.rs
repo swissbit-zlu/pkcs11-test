@@ -85,7 +85,7 @@ fn padded_bytes_to_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).trim_end().to_owned()
 }
 
-unsafe fn get_symbol<T>(library: &Library, name: &[u8]) -> Result<Symbol<T>, String> {
+unsafe fn get_symbol<'lib, T>(library: &'lib Library, name: &[u8]) -> Result<Symbol<'lib, T>, String> {
     library
         .get::<T>(name)
         .map_err(|err| format!("missing required symbol {}: {err}", String::from_utf8_lossy(name)))
