@@ -3,6 +3,7 @@ use libloading::{Library, Symbol};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use std::collections::HashMap;
+use std::env;
 use std::ffi::{c_void, CStr};
 use std::fs;
 use std::os::raw::{c_char, c_ulong};
@@ -323,14 +324,14 @@ enum Pending {
     Info(CK_RV, CK_INFO),
     Count(CK_RV, CK_ULONG),
     Slots(CK_RV, Vec<CK_SLOT_ID>),
-    SlotInfo(CK_RV, CK_SLOT_INFO),
-    TokenInfo(CK_RV, CK_TOKEN_INFO),
+    SlotInfo(CK_RV),
+    TokenInfo(CK_RV),
     Mechanisms(CK_RV, Vec<CK_MECHANISM_TYPE>),
-    MechanismInfo(CK_RV, CK_MECHANISM_INFO),
+    MechanismInfo(CK_RV),
     Session(CK_RV, CK_SESSION_HANDLE),
     Objects(CK_RV, Vec<CK_OBJECT_HANDLE>),
     Attributes(CK_RV),
-    Signature(CK_RV, Vec<CK_BYTE>),
+    Signature(CK_RV),
 }
 
 fn main() {
@@ -480,18 +481,18 @@ fn execute(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<Pendin
             "C_GetSlotInfo" => {
                 let mut info = zeroed::<CK_SLOT_INFO>();
                 let rv = dispatch.get_slot_info(resolve_slot(step, state)?, &mut info);
-                Ok(Pending::SlotInfo(rv, info))
+                Ok(Pending::SlotInfo(rv))
             }
             "C_GetTokenInfo" => {
                 let mut info = zeroed::<CK_TOKEN_INFO>();
                 let rv = dispatch.get_token_info(resolve_slot(step, state)?, &mut info);
-                Ok(Pending::TokenInfo(rv, info))
+                Ok(Pending::TokenInfo(rv))
             }
             "C_GetMechanismList" => execute_get_mechanism_list(dispatch, step, state),
             "C_GetMechanismInfo" => {
                 let mut info = zeroed::<CK_MECHANISM_INFO>();
                 let rv = dispatch.get_mechanism_info(resolve_slot(step, state)?, child_type(step)?, &mut info);
-                Ok(Pending::MechanismInfo(rv, info))
+                Ok(Pending::MechanismInfo(rv))
             }
             "C_OpenSession" => {
                 let mut session = 0;
@@ -501,23 +502,21 @@ fn execute(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<Pendin
             "C_CloseSession" => Ok(Pending::Rv(dispatch.close_session(resolve_session(step, state)?))),
             "C_CloseAllSessions" => Ok(Pending::Rv(dispatch.close_all_sessions(resolve_slot(step, state)?))),
             "C_Login" => {
-                let mut pin = child_value(step, "Pin").unwrap_or_default().into_bytes();
+                let mut pin = child_value(step, "Pin")
+                    .map(|value| resolve_value(&value, state))
+                    .unwrap_or_default()
+                    .into_bytes();
                 Ok(Pending::Rv(dispatch.login(resolve_session(step, state)?, CKU_USER, pin.as_mut_ptr(), pin.len() as CK_ULONG)))
             }
             "C_Logout" => Ok(Pending::Rv(dispatch.logout(resolve_session(step, state)?))),
             "C_FindObjectsInit" => {
                 let mut values = Vec::<Vec<u8>>::new();
-                let mut attrs = build_attributes(step, &mut values)?;
+                let mut attrs = build_find_attributes(step, &mut values)?;
                 Ok(Pending::Rv(dispatch.find_objects_init(resolve_session(step, state)?, attrs.as_mut_ptr(), attrs.len() as CK_ULONG)))
             }
             "C_FindObjects" => execute_find_objects(dispatch, step, state),
             "C_FindObjectsFinal" => Ok(Pending::Rv(dispatch.find_objects_final(resolve_session(step, state)?))),
-            "C_GetAttributeValue" => {
-                let mut values = Vec::<Vec<u8>>::new();
-                let mut attrs = build_attributes(step, &mut values)?;
-                let rv = dispatch.get_attribute_value(resolve_session(step, state)?, resolve_object(step, state)?, attrs.as_mut_ptr(), attrs.len() as CK_ULONG);
-                Ok(Pending::Attributes(rv))
-            }
+            "C_GetAttributeValue" => execute_get_attribute_value(dispatch, step, state),
             "C_SignInit" => {
                 let mut mechanism = CK_MECHANISM { mechanism: child_type(step)?, p_parameter: ptr::null_mut(), ul_parameter_len: 0 };
                 Ok(Pending::Rv(dispatch.sign_init(resolve_session(step, state)?, &mut mechanism, resolve_key(step, state)?)))
@@ -547,7 +546,7 @@ fn verify(step: &Step, pending: &mut Pending, state: &mut State) -> Result<(), S
         }
         Pending::Count(rv, count) => { verify_rv(rv, step)?; bind_count(step, state, count); Ok(()) }
         Pending::Slots(rv, slots) => { verify_rv(rv, step)?; state.slots = slots; bind_slot_vars(state); Ok(()) }
-        Pending::SlotInfo(rv, _) | Pending::TokenInfo(rv, _) | Pending::MechanismInfo(rv, _) | Pending::Attributes(rv) => verify_rv(rv, step),
+        Pending::SlotInfo(rv) | Pending::TokenInfo(rv) | Pending::MechanismInfo(rv) | Pending::Attributes(rv) => verify_rv(rv, step),
         Pending::Mechanisms(rv, mechanisms) => {
             verify_rv(rv, step)?;
             for ty in children(step, "Type").iter().filter_map(|e| e.attrs.get("value")).filter_map(|v| mechanism_from_name(v)) {
@@ -557,7 +556,7 @@ fn verify(step: &Step, pending: &mut Pending, state: &mut State) -> Result<(), S
         }
         Pending::Session(rv, session) => { verify_rv(rv, step)?; state.sessions.push(session); state.vars.insert("${Session}".to_owned(), session.to_string()); Ok(()) }
         Pending::Objects(rv, objects) => { verify_rv(rv, step)?; state.objects = objects; bind_object_vars(state); Ok(()) }
-        Pending::Signature(rv, _) => verify_rv(rv, step),
+        Pending::Signature(rv) => verify_rv(rv, step),
         Pending::None => Err(format!("{} has no pending call result", step.name)),
     }
 }
@@ -606,14 +605,43 @@ fn execute_find_objects(dispatch: &Dispatch, step: &Step, state: &mut State) -> 
     }
 }
 
+fn execute_get_attribute_value(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<Pending, String> {
+    unsafe {
+        let session = resolve_session(step, state)?;
+        let object = state
+            .objects
+            .first()
+            .copied()
+            .ok_or_else(|| "no object available".to_owned())?;
+        let mut attrs = build_attribute_queries(step)?;
+        let rv = dispatch.get_attribute_value(session, object, attrs.as_mut_ptr(), attrs.len() as CK_ULONG);
+        if rv != CKR_OK {
+            return Ok(Pending::Attributes(rv));
+        }
+
+        let mut values = attrs
+            .iter()
+            .map(|attr| vec![0; attr.ul_value_len as usize])
+            .collect::<Vec<_>>();
+        for (attr, value) in attrs.iter_mut().zip(values.iter_mut()) {
+            attr.p_value = if value.is_empty() {
+                ptr::null_mut()
+            } else {
+                value.as_mut_ptr() as CK_VOID_PTR
+            };
+        }
+        let rv = dispatch.get_attribute_value(session, object, attrs.as_mut_ptr(), attrs.len() as CK_ULONG);
+        Ok(Pending::Attributes(rv))
+    }
+}
+
 fn execute_sign(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<Pending, String> {
     unsafe {
         let mut data = hex_to_bytes(&child_value(step, "Data").unwrap_or_default())?;
         let mut length = child(step, "Signature").and_then(|e| e.attrs.get("length")).and_then(|s| resolve_value(s, state).parse::<CK_ULONG>().ok()).unwrap_or(0);
         let mut signature = if length == 0 { Vec::new() } else { vec![0; length as usize] };
         let rv = dispatch.sign(resolve_session(step, state)?, data.as_mut_ptr(), data.len() as CK_ULONG, if signature.is_empty() { ptr::null_mut() } else { signature.as_mut_ptr() }, &mut length);
-        signature.truncate(length as usize);
-        Ok(Pending::Signature(rv, signature))
+        Ok(Pending::Signature(rv))
     }
 }
 
@@ -634,13 +662,52 @@ fn child<'a>(step: &'a Step, name: &str) -> Option<&'a Element> { step.elements.
 fn child_value(step: &Step, name: &str) -> Option<String> { child(step, name).and_then(|e| e.attrs.get("value").cloned()) }
 fn attr_u8(element: &Element, name: &str, default: u8) -> Result<u8, String> { Ok(element.attrs.get(name).map(|s| s.parse::<u8>()).transpose().map_err(|err| err.to_string())?.unwrap_or(default)) }
 
-fn resolve_value(value: &str, state: &State) -> String { state.vars.get(value).cloned().unwrap_or_else(|| value.to_owned()) }
+fn resolve_value(value: &str, state: &State) -> String {
+    if let Some(resolved) = state.vars.get(value) {
+        return resolved.clone();
+    }
+    if value.starts_with("${") && value.ends_with('}') {
+        let env_name = &value[2..value.len() - 1];
+        if let Ok(resolved) = env::var(env_name) {
+            return resolved;
+        }
+    }
+    value.to_owned()
+}
 fn slot_list_len(step: &Step, state: &State) -> Option<CK_ULONG> { child(step, "SlotList").and_then(|e| e.attrs.get("length")).and_then(|s| resolve_value(s, state).parse().ok()) }
 fn mechanism_list_len(step: &Step, state: &State) -> Option<CK_ULONG> { child(step, "MechanismList").and_then(|e| e.attrs.get("length")).and_then(|s| resolve_value(s, state).parse().ok()) }
-fn resolve_slot(step: &Step, state: &State) -> Result<CK_SLOT_ID, String> { child_value(step, "SlotID").map(|v| resolve_value(&v, state).parse().map_err(|e| e.to_string())).unwrap_or_else(|| state.slots.first().copied().ok_or_else(|| "no slot available".to_owned())) }
-fn resolve_session(step: &Step, state: &State) -> Result<CK_SESSION_HANDLE, String> { child_value(step, "Session").map(|v| resolve_value(&v, state).parse().map_err(|e| e.to_string())).unwrap_or_else(|| state.sessions.first().copied().ok_or_else(|| "no session available".to_owned())) }
-fn resolve_object(step: &Step, state: &State) -> Result<CK_OBJECT_HANDLE, String> { child_value(step, "Object").map(|v| resolve_value(&v, state).parse().map_err(|e| e.to_string())).unwrap_or_else(|| state.objects.first().copied().ok_or_else(|| "no object available".to_owned())) }
-fn resolve_key(step: &Step, state: &State) -> Result<CK_OBJECT_HANDLE, String> { child_value(step, "Key").map(|v| resolve_value(&v, state).parse().map_err(|e| e.to_string())).unwrap_or_else(|| resolve_object(step, state)) }
+fn resolve_slot(step: &Step, state: &State) -> Result<CK_SLOT_ID, String> {
+    child_value(step, "SlotID")
+        .map(|v| {
+            let resolved = resolve_value(&v, state);
+            resolved.parse::<CK_SLOT_ID>().map_err(|e| format!("invalid SlotID {resolved}: {e}"))
+        })
+        .unwrap_or_else(|| state.slots.first().copied().ok_or_else(|| "no slot available".to_owned()))
+}
+fn resolve_session(step: &Step, state: &State) -> Result<CK_SESSION_HANDLE, String> {
+    child_value(step, "Session")
+        .map(|v| {
+            let resolved = resolve_value(&v, state);
+            resolved.parse::<CK_SESSION_HANDLE>().map_err(|e| format!("invalid Session {resolved}: {e}"))
+        })
+        .unwrap_or_else(|| state.sessions.first().copied().ok_or_else(|| "no session available".to_owned()))
+}
+fn resolve_object(step: &Step, state: &State) -> Result<CK_OBJECT_HANDLE, String> {
+    child_value(step, "Object")
+        .map(|v| {
+            let resolved = resolve_value(&v, state);
+            resolved.parse::<CK_OBJECT_HANDLE>().map_err(|e| format!("invalid Object {resolved}: {e}"))
+        })
+        .unwrap_or_else(|| state.objects.first().copied().ok_or_else(|| "no object available".to_owned()))
+}
+fn resolve_key(step: &Step, state: &State) -> Result<CK_OBJECT_HANDLE, String> {
+    child_value(step, "Key")
+        .map(|v| {
+            let resolved = resolve_value(&v, state);
+            resolved.parse::<CK_OBJECT_HANDLE>().map_err(|e| format!("invalid Key {resolved}: {e}"))
+        })
+        .unwrap_or_else(|| resolve_object(step, state))
+}
 
 fn child_flags(step: &Step) -> CK_FLAGS {
     let flags = child_value(step, "Flags").unwrap_or_default();
@@ -664,10 +731,13 @@ fn mechanism_from_name(name: &str) -> Option<CK_MECHANISM_TYPE> {
     }
 }
 
-fn build_attributes(step: &Step, values: &mut Vec<Vec<u8>>) -> Result<Vec<CK_ATTRIBUTE>, String> {
+fn build_find_attributes(step: &Step, values: &mut Vec<Vec<u8>>) -> Result<Vec<CK_ATTRIBUTE>, String> {
     let mut attrs = Vec::new();
     for element in children(step, "Attribute") {
         let type_name = element.attrs.get("type").ok_or_else(|| "Attribute without type".to_owned())?;
+        if type_name == "LABEL" {
+            continue;
+        }
         let type_ = attribute_type(type_name)?;
         let mut value = match element.attrs.get("value") {
             Some(v) => attribute_value(type_name, v)?,
@@ -677,6 +747,19 @@ fn build_attributes(step: &Step, values: &mut Vec<Vec<u8>>) -> Result<Vec<CK_ATT
         let len = value.len() as CK_ULONG;
         values.push(value);
         attrs.push(CK_ATTRIBUTE { type_, p_value: ptr, ul_value_len: len });
+    }
+    Ok(attrs)
+}
+
+fn build_attribute_queries(step: &Step) -> Result<Vec<CK_ATTRIBUTE>, String> {
+    let mut attrs = Vec::new();
+    for element in children(step, "Attribute") {
+        let type_name = element.attrs.get("type").ok_or_else(|| "Attribute without type".to_owned())?;
+        attrs.push(CK_ATTRIBUTE {
+            type_: attribute_type(type_name)?,
+            p_value: ptr::null_mut(),
+            ul_value_len: 0,
+        });
     }
     Ok(attrs)
 }
