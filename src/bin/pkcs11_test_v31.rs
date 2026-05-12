@@ -12,8 +12,27 @@ use std::ptr;
 const CKR_OK: CK_RV = 0;
 const CK_TRUE: CK_BBOOL = 1;
 
+const CKF_TOKEN_PRESENT: CK_FLAGS = 0x00000001;
+const CKF_REMOVABLE_DEVICE: CK_FLAGS = 0x00000002;
+const CKF_HW_SLOT: CK_FLAGS = 0x00000004;
+
 const CKF_RW_SESSION: CK_FLAGS = 0x00000002;
 const CKF_SERIAL_SESSION: CK_FLAGS = 0x00000004;
+
+const CKF_RNG: CK_FLAGS = 0x00000001;
+const CKF_LOGIN_REQUIRED: CK_FLAGS = 0x00000004;
+const CKF_USER_PIN_INITIALIZED: CK_FLAGS = 0x00000008;
+const CKF_RESTORE_KEY_NOT_NEEDED: CK_FLAGS = 0x00000020;
+const CKF_TOKEN_INITIALIZED: CK_FLAGS = 0x00000400;
+
+const CKF_ENCRYPT: CK_FLAGS = 0x00000100;
+const CKF_DECRYPT: CK_FLAGS = 0x00000200;
+const CKF_DIGEST: CK_FLAGS = 0x00000400;
+const CKF_SIGN: CK_FLAGS = 0x00000800;
+const CKF_VERIFY: CK_FLAGS = 0x00002000;
+const CKF_GENERATE_KEY_PAIR: CK_FLAGS = 0x00010000;
+const CKF_WRAP: CK_FLAGS = 0x00020000;
+const CKF_UNWRAP: CK_FLAGS = 0x00040000;
 
 const CKU_USER: CK_USER_TYPE = 1;
 
@@ -301,10 +320,12 @@ struct Args {
 struct Element {
     name: String,
     attrs: HashMap<String, String>,
+    depth: usize,
 }
 
 struct Step {
     name: String,
+    attrs: HashMap<String, String>,
     rv: String,
     is_expectation: bool,
     elements: Vec<Element>,
@@ -320,18 +341,49 @@ struct State {
 
 enum Pending {
     None,
+    Error(String),
     Rv(CK_RV),
     Info(CK_RV, CK_INFO),
     Count(CK_RV, CK_ULONG),
     Slots(CK_RV, Vec<CK_SLOT_ID>),
-    SlotInfo(CK_RV),
-    TokenInfo(CK_RV),
+    SlotInfo(CK_RV, CK_SLOT_INFO),
+    TokenInfo(CK_RV, CK_TOKEN_INFO),
     Mechanisms(CK_RV, Vec<CK_MECHANISM_TYPE>),
-    MechanismInfo(CK_RV),
+    MechanismInfo(CK_RV, CK_MECHANISM_INFO),
     Session(CK_RV, CK_SESSION_HANDLE),
     Objects(CK_RV, Vec<CK_OBJECT_HANDLE>),
-    Attributes(CK_RV),
-    Signature(CK_RV),
+    Attributes(CK_RV, Vec<AttributeSnapshot>),
+    Signature(CK_RV, Vec<u8>, CK_ULONG),
+}
+
+struct AttributeSnapshot {
+    type_: CK_ULONG,
+    len: CK_ULONG,
+    value: Vec<u8>,
+}
+
+#[derive(Default)]
+struct TestReport {
+    pass: usize,
+    fail: usize,
+    first_error: Option<String>,
+}
+
+impl TestReport {
+    fn passed(&self) -> bool { self.fail == 0 }
+
+    fn record_pass(&mut self) {
+        self.pass += 1;
+        println!("PASS");
+    }
+
+    fn record_fail(&mut self, step: &Step, err: String) {
+        self.fail += 1;
+        if self.first_error.is_none() {
+            self.first_error = Some(format!("{}: {err}", step.name));
+        }
+        println!("FAIL {}: {err}", step.name);
+    }
 }
 
 fn main() {
@@ -345,17 +397,49 @@ fn run() -> Result<(), String> {
     let args = Args::parse();
     let dispatch = unsafe { Dispatch::load(&args.module)? };
     let tests = load_tests(&args)?;
-    let mut pass = 0usize;
-    let mut fail = 0usize;
+    let mut xml_pass = 0usize;
+    let mut xml_fail = 0usize;
+    let mut test_pass = 0usize;
+    let mut test_fail = 0usize;
+    let mut failed_xml = Vec::new();
+
     for (name, xml) in tests {
-        println!("\nTEST {name}");
+        println!("\nStarting test");
+        println!("{name}");
         match run_test(&dispatch, &xml) {
-            Ok(()) => { pass += 1; println!("PASS {name}"); }
-            Err(err) => { fail += 1; println!("FAIL {name}: {err}"); }
+            Ok(report) => {
+                test_pass += report.pass;
+                test_fail += report.fail;
+                if report.passed() {
+                    xml_pass += 1;
+                    println!("XML PASS {name}");
+                } else {
+                    xml_fail += 1;
+                    let err = report.first_error.unwrap_or_else(|| "test failed".to_owned());
+                    println!("XML FAIL {name}: {err}");
+                    failed_xml.push((name, err));
+                }
+            }
+            Err(err) => {
+                xml_fail += 1;
+                test_fail += 1;
+                println!("FAIL {name}: {err}");
+                println!("XML FAIL {name}: {err}");
+                failed_xml.push((name, err));
+            }
         }
     }
-    println!("\nSUMMARY PASS={pass} FAIL={fail}");
-    if fail == 0 { Ok(()) } else { Err(format!("{fail} test file(s) failed")) }
+
+    println!("\nSUMMARY PASS={test_pass} FAIL={test_fail}");
+    println!("XML SUMMARY PASS={xml_pass} FAIL={xml_fail}");
+    if !failed_xml.is_empty() {
+        println!("XML FAILURES:");
+        for (name, err) in &failed_xml {
+            println!("  {name}: {err}");
+        }
+    }
+
+    if xml_fail == 0 { Ok(()) } else { Err(format!("{xml_fail} XML test file(s) failed")) }
 }
 
 fn load_tests(args: &Args) -> Result<Vec<(String, String)>, String> {
@@ -374,18 +458,28 @@ fn load_tests(args: &Args) -> Result<Vec<(String, String)>, String> {
     ])
 }
 
-fn run_test(dispatch: &Dispatch, xml: &str) -> Result<(), String> {
+fn run_test(dispatch: &Dispatch, xml: &str) -> Result<TestReport, String> {
     let steps = parse_steps(xml)?;
     let mut state = State::default();
     let mut pending = Pending::None;
+    let mut report = TestReport::default();
+
     for step in steps {
+        print_step(&step);
         if step.is_expectation {
-            verify(&step, &mut pending, &mut state)?;
+            match verify(&step, &mut pending, &mut state) {
+                Ok(()) => report.record_pass(),
+                Err(err) => report.record_fail(&step, err),
+            }
         } else {
-            pending = execute(dispatch, &step, &mut state)?;
+            pending = match execute(dispatch, &step, &mut state) {
+                Ok(pending) => pending,
+                Err(err) => Pending::Error(err),
+            };
         }
     }
-    Ok(())
+
+    Ok(report)
 }
 
 fn parse_steps(xml: &str) -> Result<Vec<Step>, String> {
@@ -409,7 +503,24 @@ fn parse_steps(xml: &str) -> Result<Vec<Step>, String> {
 
 fn is_call(name: &[u8]) -> bool { name.starts_with(b"C_") }
 
-fn element_from(e: &BytesStart) -> Result<Element, String> {
+fn print_step(step: &Step) {
+    print_xml_element(&step.name, &step.attrs, 1);
+    for element in &step.elements {
+        print_xml_element(&element.name, &element.attrs, element.depth + 2);
+    }
+}
+
+fn print_xml_element(name: &str, attrs: &HashMap<String, String>, indent: usize) {
+    print!("{}{}", "  ".repeat(indent), name);
+    let mut attr_names = attrs.keys().collect::<Vec<_>>();
+    attr_names.sort();
+    for attr_name in attr_names {
+        print!(" {}={}", attr_name, attrs.get(attr_name).unwrap());
+    }
+    println!();
+}
+
+fn element_from(e: &BytesStart, depth: usize) -> Result<Element, String> {
     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
     let mut attrs = HashMap::new();
     for attr in e.attributes() {
@@ -419,28 +530,31 @@ fn element_from(e: &BytesStart) -> Result<Element, String> {
             String::from_utf8_lossy(attr.value.as_ref()).to_string(),
         );
     }
-    Ok(Element { name, attrs })
+    Ok(Element { name, attrs, depth })
 }
 
 fn step_from_empty(e: &BytesStart) -> Result<Step, String> {
-    let element = element_from(e)?;
+    let element = element_from(e, 0)?;
+    let rv = element.attrs.get("rv").cloned().unwrap_or_else(|| "OK".to_owned());
+    let is_expectation = element.attrs.contains_key("rv");
     Ok(Step {
         name: element.name,
-        rv: element.attrs.get("rv").cloned().unwrap_or_else(|| "OK".to_owned()),
-        is_expectation: element.attrs.contains_key("rv"),
+        attrs: element.attrs,
+        rv,
+        is_expectation,
         elements: Vec::new(),
     })
 }
 
 fn collect_step(reader: &mut Reader<&[u8]>, start: BytesStart) -> Result<Step, String> {
-    let top = element_from(&start)?;
+    let top = element_from(&start, 0)?;
     let mut elements = Vec::new();
     let mut depth = 0usize;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf).map_err(|err| err.to_string())? {
-            Event::Start(e) => { elements.push(element_from(&e)?); depth += 1; }
-            Event::Empty(e) => elements.push(element_from(&e)?),
+            Event::Start(e) => { elements.push(element_from(&e, depth)?); depth += 1; }
+            Event::Empty(e) => elements.push(element_from(&e, depth)?),
             Event::End(e) => {
                 if depth == 0 && e.name().as_ref() == top.name.as_bytes() { break; }
                 depth = depth.saturating_sub(1);
@@ -450,21 +564,19 @@ fn collect_step(reader: &mut Reader<&[u8]>, start: BytesStart) -> Result<Step, S
         }
         buf.clear();
     }
+    let rv = top.attrs.get("rv").cloned().unwrap_or_else(|| "OK".to_owned());
+    let is_expectation = top.attrs.contains_key("rv");
     Ok(Step {
         name: top.name,
-        rv: top.attrs.get("rv").cloned().unwrap_or_else(|| "OK".to_owned()),
-        is_expectation: top.attrs.contains_key("rv"),
+        attrs: top.attrs,
+        rv,
+        is_expectation,
         elements,
     })
 }
 
 fn ck_ok(rv: CK_RV, context: &str) -> Result<(), String> {
     if rv == CKR_OK { Ok(()) } else { Err(format!("{context} returned CK_RV=0x{rv:x}")) }
-}
-
-fn expected_ok(step: &Step) -> bool { step.rv == "OK" }
-fn verify_rv(rv: CK_RV, step: &Step) -> Result<(), String> {
-    if expected_ok(step) && rv != CKR_OK { Err(format!("{} expected OK, got CK_RV=0x{rv:x}", step.name)) } else { Ok(()) }
 }
 
 fn execute(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<Pending, String> {
@@ -481,18 +593,18 @@ fn execute(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<Pendin
             "C_GetSlotInfo" => {
                 let mut info = zeroed::<CK_SLOT_INFO>();
                 let rv = dispatch.get_slot_info(resolve_slot(step, state)?, &mut info);
-                Ok(Pending::SlotInfo(rv))
+                Ok(Pending::SlotInfo(rv, info))
             }
             "C_GetTokenInfo" => {
                 let mut info = zeroed::<CK_TOKEN_INFO>();
                 let rv = dispatch.get_token_info(resolve_slot(step, state)?, &mut info);
-                Ok(Pending::TokenInfo(rv))
+                Ok(Pending::TokenInfo(rv, info))
             }
             "C_GetMechanismList" => execute_get_mechanism_list(dispatch, step, state),
             "C_GetMechanismInfo" => {
                 let mut info = zeroed::<CK_MECHANISM_INFO>();
                 let rv = dispatch.get_mechanism_info(resolve_slot(step, state)?, child_type(step)?, &mut info);
-                Ok(Pending::MechanismInfo(rv))
+                Ok(Pending::MechanismInfo(rv, info))
             }
             "C_OpenSession" => {
                 let mut session = 0;
@@ -528,37 +640,428 @@ fn execute(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<Pendin
 }
 
 fn verify(step: &Step, pending: &mut Pending, state: &mut State) -> Result<(), String> {
+    let mut ok = true;
     match std::mem::replace(pending, Pending::None) {
-        Pending::Rv(rv) => verify_rv(rv, step),
+        Pending::Error(err) => return Err(err),
+        Pending::Rv(rv) => ok &= trace_rv(rv, step),
         Pending::Info(rv, info) => {
-            verify_rv(rv, step)?;
-            if let Some(v) = child(step, "CryptokiVersion") {
-                let major = attr_u8(v, "major", 3)?;
-                let minor = attr_u8(v, "minor", 1)?;
-                if info.cryptoki_version.major != major || info.cryptoki_version.minor != minor {
-                    return Err(format!("C_GetInfo returned Cryptoki {}.{}, expected {major}.{minor}", info.cryptoki_version.major, info.cryptoki_version.minor));
-                }
-            }
-            if let Some(flags) = child(step, "Flags").and_then(|e| e.attrs.get("value")) {
-                if flags == "0x0" && info.flags != 0 { return Err(format!("C_GetInfo flags 0x{:x}, expected 0x0", info.flags)); }
-            }
-            Ok(())
+            ok &= trace_rv(rv, step);
+            ok &= trace_info(step, &info)?;
         }
-        Pending::Count(rv, count) => { verify_rv(rv, step)?; bind_count(step, state, count); Ok(()) }
-        Pending::Slots(rv, slots) => { verify_rv(rv, step)?; state.slots = slots; bind_slot_vars(state); Ok(()) }
-        Pending::SlotInfo(rv) | Pending::TokenInfo(rv) | Pending::MechanismInfo(rv) | Pending::Attributes(rv) => verify_rv(rv, step),
+        Pending::Count(rv, count) => {
+            ok &= trace_rv(rv, step);
+            ok &= trace_count(step, state, count)?;
+            bind_count(step, state, count);
+        }
+        Pending::Slots(rv, slots) => {
+            ok &= trace_rv(rv, step);
+            ok &= trace_slots(step, state, &slots)?;
+            state.slots = slots;
+            bind_slot_vars(state);
+        }
+        Pending::SlotInfo(rv, info) => {
+            ok &= trace_rv(rv, step);
+            ok &= trace_slot_info(step, &info)?;
+        }
+        Pending::TokenInfo(rv, info) => {
+            ok &= trace_rv(rv, step);
+            ok &= trace_token_info(step, &info)?;
+        }
         Pending::Mechanisms(rv, mechanisms) => {
-            verify_rv(rv, step)?;
-            for ty in children(step, "Type").iter().filter_map(|e| e.attrs.get("value")).filter_map(|v| mechanism_from_name(v)) {
-                if !mechanisms.contains(&ty) { return Err(format!("mechanism 0x{ty:x} not returned by C_GetMechanismList")); }
-            }
-            Ok(())
+            ok &= trace_rv(rv, step);
+            ok &= trace_mechanisms(step, &mechanisms);
         }
-        Pending::Session(rv, session) => { verify_rv(rv, step)?; state.sessions.push(session); state.vars.insert("${Session}".to_owned(), session.to_string()); Ok(()) }
-        Pending::Objects(rv, objects) => { verify_rv(rv, step)?; state.objects = objects; bind_object_vars(state); Ok(()) }
-        Pending::Signature(rv) => verify_rv(rv, step),
-        Pending::None => Err(format!("{} has no pending call result", step.name)),
+        Pending::MechanismInfo(rv, info) => {
+            ok &= trace_rv(rv, step);
+            ok &= trace_mechanism_info(step, &info)?;
+        }
+        Pending::Session(rv, session) => {
+            ok &= trace_rv(rv, step);
+            ok &= trace_session(step, state, session)?;
+            if rv == CKR_OK {
+                state.sessions.push(session);
+                state.vars.insert("${Session}".to_owned(), session.to_string());
+            }
+        }
+        Pending::Objects(rv, objects) => {
+            ok &= trace_rv(rv, step);
+            ok &= trace_objects(step, state, &objects)?;
+            if rv == CKR_OK {
+                state.objects = objects;
+                bind_object_vars(state);
+            }
+        }
+        Pending::Attributes(rv, attributes) => {
+            ok &= trace_rv(rv, step);
+            ok &= trace_attributes(step, &attributes)?;
+        }
+        Pending::Signature(rv, signature, length) => {
+            ok &= trace_rv(rv, step);
+            ok &= trace_signature(step, &signature, length)?;
+        }
+        Pending::None => return Err(format!("{} has no pending call result", step.name)),
     }
+
+    if ok { Ok(()) } else { Err("actual response did not match expectation".to_owned()) }
+}
+
+fn trace_rv(rv: CK_RV, step: &Step) -> bool {
+    let actual = rv_to_string(rv);
+    println!("  RV                           {:?} vs {:?}", actual, step.rv);
+    if step.rv == "OK" {
+        rv == CKR_OK
+    } else {
+        rv != CKR_OK
+    }
+}
+
+fn trace_info(step: &Step, info: &CK_INFO) -> Result<bool, String> {
+    let mut ok = true;
+    let (major, minor) = version_expectation(step, "CryptokiVersion", 3, 1)?;
+    println!("  CryptokiVersion               {:?}.{:?} vs {:?}.{:?}", info.cryptoki_version.major, info.cryptoki_version.minor, major, minor);
+    ok &= info.cryptoki_version.major == major && info.cryptoki_version.minor == minor;
+
+    let manufacturer_id = child_value(step, "ManufacturerID").unwrap_or_default();
+    println!("  ManufacturerID (may vary)     {:?} vs {:?}", padded_string(&info.manufacturer_id), manufacturer_id.trim());
+
+    let flags = child_value(step, "Flags").unwrap_or_else(|| "0x0".to_owned());
+    println!("  Flags                         {:?} vs {:?}", format!("0x{:x}", info.flags), flags);
+    ok &= flags != "0x0" || info.flags == 0;
+
+    let (lib_major, lib_minor) = version_expectation(step, "LibraryVersion", 1, 0)?;
+    println!("  LibraryVersion (may vary)     {:?}.{:?} vs {:?}.{:?}", info.library_version.major, info.library_version.minor, lib_major, lib_minor);
+
+    let description = child_value(step, "LibraryDescription").unwrap_or_default();
+    println!("  LibraryDescription (may vary) {:?} vs {:?}", padded_string(&info.library_description), description.trim());
+    Ok(ok)
+}
+
+fn trace_count(step: &Step, state: &mut State, count: CK_ULONG) -> Result<bool, String> {
+    let list_name = if step.name == "C_GetMechanismList" { "MechanismList" } else { "SlotList" };
+    let expected = child(step, list_name)
+        .and_then(|e| e.attrs.get("length"))
+        .cloned()
+        .unwrap_or_else(|| count.to_string());
+    let actual = count.to_string();
+    let expected = resolve_expected_or_actual(&expected, &actual, state);
+    println!("  {list_name} length {:?} vs {:?}", actual, expected);
+    Ok(actual == expected)
+}
+
+fn trace_slots(step: &Step, state: &mut State, slots: &[CK_SLOT_ID]) -> Result<bool, String> {
+    let mut ok = true;
+    if let Some(expected) = child(step, "SlotList").and_then(|e| e.attrs.get("length")).cloned() {
+        let actual = slots.len().to_string();
+        let expected = resolve_expected_or_actual(&expected, &actual, state);
+        println!("  SlotList length {:?} vs {:?}", actual, expected);
+        ok &= actual == expected;
+    }
+    if let Some(expected) = child_value(step, "SlotID") {
+        let actual = slots.first().copied().unwrap_or_default().to_string();
+        let expected = resolve_expected_or_actual(&expected, &actual, state);
+        println!("  SlotID                        {:?} vs {:?}", actual, expected);
+        ok &= actual == expected;
+    }
+    Ok(ok)
+}
+
+fn trace_slot_info(step: &Step, info: &CK_SLOT_INFO) -> Result<bool, String> {
+    let expected_description = child_value(step, "SlotDescription").unwrap_or_default();
+    println!("  SlotDescription (may vary)    {:?} vs {:?}", padded_string(&info.slot_description), expected_description.trim());
+
+    let expected_manufacturer = child_value(step, "ManufacturerID").unwrap_or_default();
+    println!("  ManufacturerID (may vary)     {:?} vs {:?}", padded_string(&info.manufacturer_id), expected_manufacturer.trim());
+
+    let expected_flags = child_value(step, "Flags").unwrap_or_default();
+    let actual_flags = slot_flags_to_string(info.flags);
+    println!("  Flags                         {:?} vs {:?}", actual_flags, expected_flags);
+    let ok = listed_flags_match(info.flags, &expected_flags, &[
+        ("TOKEN_PRESENT", CKF_TOKEN_PRESENT),
+        ("REMOVABLE_DEVICE", CKF_REMOVABLE_DEVICE),
+        ("HW_SLOT", CKF_HW_SLOT),
+    ]);
+
+    let (hw_major, hw_minor) = version_expectation(step, "HardwareVersion", 1, 0)?;
+    println!("  HardwareVersion (may vary)     {:?}.{:?} vs {:?}.{:?}", info.hardware_version.major, info.hardware_version.minor, hw_major, hw_minor);
+
+    let (fw_major, fw_minor) = version_expectation(step, "FirmwareVersion", 1, 0)?;
+    println!("  FirmwareVersion (may vary)     {:?}.{:?} vs {:?}.{:?}", info.firmware_version.major, info.firmware_version.minor, fw_major, fw_minor);
+    Ok(ok)
+}
+
+fn trace_token_info(step: &Step, info: &CK_TOKEN_INFO) -> Result<bool, String> {
+    let mut ok = true;
+    ok &= trace_token_count("MaxSessionCount", info.max_session_count, step, "0")?;
+    ok &= trace_token_count("SessionCount", info.session_count, step, "0")?;
+    ok &= trace_token_count("MaxRwSessionCount", info.max_rw_session_count, step, "0")?;
+    ok &= trace_token_count("RwSessionCount", info.rw_session_count, step, "0")?;
+    ok &= trace_token_count("MaxPinLen", info.max_pin_len, step, "255")?;
+    ok &= trace_token_count("MinPinLen", info.min_pin_len, step, "4")?;
+    ok &= trace_memory_count("TotalPrivateMemory", info.total_private_memory, step, "0")?;
+    ok &= trace_memory_count("FreePrivateMemory", info.free_private_memory, step, "0")?;
+    ok &= trace_memory_count("TotalPublicMemory", info.total_public_memory, step, "0")?;
+    ok &= trace_memory_count("FreePublicMemory", info.free_public_memory, step, "0")?;
+
+    println!("  label (may vary)     {:?} vs {:?}", padded_string(&info.label), child_value(step, "label").unwrap_or_default().trim());
+    println!("  ManufacturerID (may vary)     {:?} vs {:?}", padded_string(&info.manufacturer_id), child_value(step, "ManufacturerID").unwrap_or_default().trim());
+    println!("  model (may vary)     {:?} vs {:?}", padded_string(&info.model), child_value(step, "model").unwrap_or_default().trim());
+    println!("  serialNumber (may vary)     {:?} vs {:?}", padded_string(&info.serial_number), child_value(step, "serialNumber").unwrap_or_default().trim());
+
+    let expected_flags = child_value(step, "Flags").unwrap_or_default();
+    let actual_flags = token_flags_to_string(info.flags);
+    println!("  Flags     {:?} vs {:?}", actual_flags, expected_flags);
+    ok &= listed_flags_match(info.flags, &expected_flags, &[
+        ("RNG", CKF_RNG),
+        ("LOGIN_REQUIRED", CKF_LOGIN_REQUIRED),
+        ("USER_PIN_INITIALIZED", CKF_USER_PIN_INITIALIZED),
+        ("RESTORE_KEY_NOT_NEEDED", CKF_RESTORE_KEY_NOT_NEEDED),
+        ("TOKEN_INITIALIZED", CKF_TOKEN_INITIALIZED),
+    ]);
+
+    let (hw_major, hw_minor) = version_expectation(step, "HardwareVersion", 1, 0)?;
+    println!("  HardwareVersion (may vary)     {:?}.{:?} vs {:?}.{:?}", info.hardware_version.major, info.hardware_version.minor, hw_major, hw_minor);
+    let (fw_major, fw_minor) = version_expectation(step, "FirmwareVersion", 1, 0)?;
+    println!("  FirmwareVersion (may vary)     {:?}.{:?} vs {:?}.{:?}", info.firmware_version.major, info.firmware_version.minor, fw_major, fw_minor);
+    println!("  utcTime (may vary)     {:?} vs {:?}", padded_string(&info.utc_time), child_value(step, "utcTime").unwrap_or_default().trim());
+    Ok(ok)
+}
+
+fn trace_mechanisms(step: &Step, mechanisms: &[CK_MECHANISM_TYPE]) -> bool {
+    let mut ok = true;
+    for mechanism in children(step, "Type").iter().filter_map(|e| e.attrs.get("value")) {
+        if let Some(expected_type) = mechanism_from_name(mechanism) {
+            let present = mechanisms.contains(&expected_type);
+            println!("  Mechanism {:?} present {:?} vs {:?}", mechanism, present, true);
+            ok &= present;
+        }
+    }
+    ok
+}
+
+fn trace_mechanism_info(step: &Step, info: &CK_MECHANISM_INFO) -> Result<bool, String> {
+    let mut ok = true;
+    let min = info_attr(step, "MinKeySize", "0").parse::<CK_ULONG>().map_err(|e| e.to_string())?;
+    let max = info_attr(step, "MaxKeySize", "0").parse::<CK_ULONG>().map_err(|e| e.to_string())?;
+    println!("  MaxKeySize {:?} vs {:?}", info.max_key_size, max);
+    println!("  MinKeySize {:?} vs {:?}", info.min_key_size, min);
+    ok &= info.max_key_size == max;
+    ok &= info.min_key_size == min;
+
+    let expected_flags = child_value(step, "Flags").unwrap_or_default();
+    let actual_flags = mechanism_flags_to_string(info.flags);
+    println!("  Flags      {:?} vs {:?}", actual_flags, expected_flags);
+    ok &= listed_flags_match(info.flags, &expected_flags, &[
+        ("DIGEST", CKF_DIGEST),
+        ("GENERATE_KEY_PAIR", CKF_GENERATE_KEY_PAIR),
+        ("ENCRYPT", CKF_ENCRYPT),
+        ("DECRYPT", CKF_DECRYPT),
+        ("SIGN", CKF_SIGN),
+        ("VERIFY", CKF_VERIFY),
+        ("WRAP", CKF_WRAP),
+        ("UNWRAP", CKF_UNWRAP),
+    ]);
+    Ok(ok)
+}
+
+fn trace_session(step: &Step, state: &mut State, session: CK_SESSION_HANDLE) -> Result<bool, String> {
+    let actual = session.to_string();
+    let expected = child_value(step, "Session").unwrap_or_else(|| actual.clone());
+    let expected = resolve_expected_or_actual(&expected, &actual, state);
+    println!("  Session                       {:?} vs {:?}", actual, expected);
+    Ok(actual == expected)
+}
+
+fn trace_objects(step: &Step, state: &mut State, objects: &[CK_OBJECT_HANDLE]) -> Result<bool, String> {
+    let expected = child(step, "Object")
+        .and_then(|e| e.attrs.get("length"))
+        .cloned()
+        .unwrap_or_else(|| objects.len().to_string());
+    let expected_len = expected.parse::<usize>().map_err(|e| e.to_string())?;
+    println!("  Object length {:?} >=? {:?}", objects.len(), expected_len);
+    let mut ok = objects.len() >= expected_len;
+    for (i, expected_object) in children(step, "Object")
+        .iter()
+        .filter_map(|e| e.attrs.get("value"))
+        .enumerate()
+    {
+        let actual = objects.get(i).copied().unwrap_or_default().to_string();
+        let expected = resolve_expected_or_actual(expected_object, &actual, state);
+        println!("  Object[{i}]                    {:?} vs {:?}", actual, expected);
+        ok &= actual == expected;
+    }
+    Ok(ok)
+}
+
+fn trace_attributes(step: &Step, attributes: &[AttributeSnapshot]) -> Result<bool, String> {
+    let mut ok = true;
+    for expected in children(step, "Attribute") {
+        let type_name = expected.attrs.get("type").ok_or_else(|| "Attribute without type".to_owned())?;
+        let type_ = attribute_type(type_name)?;
+        let actual = attributes.iter().find(|attr| attr.type_ == type_);
+        if let Some(actual) = actual {
+            if let Some(length) = expected.attrs.get("length") {
+                println!("  Attribute {type_name} length (may vary) {:?} vs {:?}", actual.len, length);
+            }
+            if let Some(value) = expected.attrs.get("value") {
+                println!("  Attribute {type_name} value (may vary) {:?} vs {:?}", bytes_to_hex(&actual.value), value);
+            }
+        } else {
+            println!("  Attribute {type_name} not found in {:?}", attribute_names(attributes));
+            ok = false;
+        }
+    }
+    Ok(ok)
+}
+
+fn trace_signature(step: &Step, signature: &[u8], length: CK_ULONG) -> Result<bool, String> {
+    let expected_length = child(step, "Signature").and_then(|e| e.attrs.get("length")).and_then(|s| s.parse::<CK_ULONG>().ok()).unwrap_or(length);
+    println!("  Signature length (may vary) {:?} vs {:?}", length, expected_length);
+    if let Some(expected) = child_value(step, "Signature") {
+        println!("  Signature value (may vary) {:?} vs {:?}", bytes_to_hex(signature), expected);
+        Ok(!signature.is_empty() || expected.is_empty())
+    } else {
+        Ok(length == expected_length || length > 0)
+    }
+}
+
+fn rv_to_string(rv: CK_RV) -> String {
+    if rv == CKR_OK { "OK".to_owned() } else { format!("CK_RV=0x{rv:x}") }
+}
+
+fn version_expectation(step: &Step, name: &str, default_major: u8, default_minor: u8) -> Result<(u8, u8), String> {
+    let element = child(step, name);
+    let major = element
+        .and_then(|e| e.attrs.get("major"))
+        .map(|s| s.parse::<u8>())
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(default_major);
+    let minor = element
+        .and_then(|e| e.attrs.get("minor"))
+        .map(|s| s.parse::<u8>())
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(default_minor);
+    Ok((major, minor))
+}
+
+fn padded_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim_end_matches('\0')
+        .trim_end()
+        .to_owned()
+}
+
+fn resolve_expected_or_actual(value: &str, actual: &str, state: &mut State) -> String {
+    if let Some(resolved) = state.vars.get(value) {
+        return resolved.clone();
+    }
+    if value.starts_with("${") && value.ends_with('}') {
+        let env_name = &value[2..value.len() - 1];
+        if let Ok(resolved) = env::var(env_name) {
+            state.vars.insert(value.to_owned(), resolved.clone());
+            return resolved;
+        }
+        state.vars.insert(value.to_owned(), actual.to_owned());
+        return actual.to_owned();
+    }
+    value.to_owned()
+}
+
+fn info_attr(step: &Step, name: &str, default: &str) -> String {
+    child(step, "Info")
+        .and_then(|e| e.attrs.get(name))
+        .cloned()
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn trace_token_count(name: &str, actual: CK_ULONG, step: &Step, default: &str) -> Result<bool, String> {
+    let expected = info_attr(step, name, default);
+    let expected_value = expected.parse::<CK_ULONG>().map_err(|e| e.to_string())?;
+    println!("  {name} {:?} vs {:?}", actual, expected_value);
+    Ok(actual == expected_value)
+}
+
+fn trace_memory_count(name: &str, actual: CK_ULONG, step: &Step, default: &str) -> Result<bool, String> {
+    let expected = info_attr(step, name, default);
+    let expected_value = expected.parse::<CK_ULONG>().map_err(|e| e.to_string())?;
+    println!("  {name} {:?} vs {:?}", memory_to_string(actual), expected);
+    Ok(actual == expected_value || (actual == CK_ULONG::MAX && expected_value == 0))
+}
+
+fn memory_to_string(value: CK_ULONG) -> String {
+    if value == CK_ULONG::MAX { "unavailable".to_owned() } else { value.to_string() }
+}
+
+fn listed_flags_match(actual: CK_FLAGS, expected: &str, flags: &[(&str, CK_FLAGS)]) -> bool {
+    flags.iter().all(|(name, bit)| !expected.contains(name) || actual & *bit != 0)
+}
+
+fn slot_flags_to_string(flags: CK_FLAGS) -> String {
+    flags_to_string(flags, &[
+        ("TOKEN_PRESENT", CKF_TOKEN_PRESENT),
+        ("REMOVABLE_DEVICE", CKF_REMOVABLE_DEVICE),
+        ("HW_SLOT", CKF_HW_SLOT),
+    ])
+}
+
+fn token_flags_to_string(flags: CK_FLAGS) -> String {
+    flags_to_string(flags, &[
+        ("RNG", CKF_RNG),
+        ("LOGIN_REQUIRED", CKF_LOGIN_REQUIRED),
+        ("USER_PIN_INITIALIZED", CKF_USER_PIN_INITIALIZED),
+        ("RESTORE_KEY_NOT_NEEDED", CKF_RESTORE_KEY_NOT_NEEDED),
+        ("TOKEN_INITIALIZED", CKF_TOKEN_INITIALIZED),
+    ])
+}
+
+fn mechanism_flags_to_string(flags: CK_FLAGS) -> String {
+    flags_to_string(flags, &[
+        ("DIGEST", CKF_DIGEST),
+        ("GENERATE_KEY_PAIR", CKF_GENERATE_KEY_PAIR),
+        ("ENCRYPT", CKF_ENCRYPT),
+        ("DECRYPT", CKF_DECRYPT),
+        ("SIGN", CKF_SIGN),
+        ("VERIFY", CKF_VERIFY),
+        ("WRAP", CKF_WRAP),
+        ("UNWRAP", CKF_UNWRAP),
+    ])
+}
+
+fn flags_to_string(flags: CK_FLAGS, names: &[(&str, CK_FLAGS)]) -> String {
+    let mut out = names
+        .iter()
+        .filter_map(|(name, bit)| if flags & *bit != 0 { Some(*name) } else { None })
+        .collect::<Vec<_>>()
+        .join("|");
+    if out.is_empty() {
+        out = "0x0".to_owned();
+    }
+    out
+}
+
+fn attribute_names(attributes: &[AttributeSnapshot]) -> Vec<String> {
+    attributes.iter().map(|attr| attribute_type_name(attr.type_).to_owned()).collect()
+}
+
+fn attribute_type_name(type_: CK_ULONG) -> &'static str {
+    match type_ {
+        CKA_CLASS => "CLASS",
+        CKA_TOKEN => "TOKEN",
+        CKA_LABEL => "LABEL",
+        CKA_VALUE => "VALUE",
+        CKA_MODULUS => "MODULUS",
+        CKA_PUBLIC_EXPONENT => "PUBLIC_EXPONENT",
+        _ => "UNKNOWN",
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 unsafe fn zeroed<T>() -> T { std::mem::zeroed() }
@@ -608,15 +1111,11 @@ fn execute_find_objects(dispatch: &Dispatch, step: &Step, state: &mut State) -> 
 fn execute_get_attribute_value(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<Pending, String> {
     unsafe {
         let session = resolve_session(step, state)?;
-        let object = state
-            .objects
-            .first()
-            .copied()
-            .ok_or_else(|| "no object available".to_owned())?;
+        let object = resolve_object(step, state)?;
         let mut attrs = build_attribute_queries(step)?;
         let rv = dispatch.get_attribute_value(session, object, attrs.as_mut_ptr(), attrs.len() as CK_ULONG);
         if rv != CKR_OK {
-            return Ok(Pending::Attributes(rv));
+            return Ok(Pending::Attributes(rv, attribute_snapshots(&attrs, &[])));
         }
 
         let mut values = attrs
@@ -631,7 +1130,7 @@ fn execute_get_attribute_value(dispatch: &Dispatch, step: &Step, state: &mut Sta
             };
         }
         let rv = dispatch.get_attribute_value(session, object, attrs.as_mut_ptr(), attrs.len() as CK_ULONG);
-        Ok(Pending::Attributes(rv))
+        Ok(Pending::Attributes(rv, attribute_snapshots(&attrs, &values)))
     }
 }
 
@@ -641,8 +1140,20 @@ fn execute_sign(dispatch: &Dispatch, step: &Step, state: &mut State) -> Result<P
         let mut length = child(step, "Signature").and_then(|e| e.attrs.get("length")).and_then(|s| resolve_value(s, state).parse::<CK_ULONG>().ok()).unwrap_or(0);
         let mut signature = if length == 0 { Vec::new() } else { vec![0; length as usize] };
         let rv = dispatch.sign(resolve_session(step, state)?, data.as_mut_ptr(), data.len() as CK_ULONG, if signature.is_empty() { ptr::null_mut() } else { signature.as_mut_ptr() }, &mut length);
-        Ok(Pending::Signature(rv))
+        signature.truncate(length as usize);
+        Ok(Pending::Signature(rv, signature, length))
     }
+}
+
+fn attribute_snapshots(attrs: &[CK_ATTRIBUTE], values: &[Vec<u8>]) -> Vec<AttributeSnapshot> {
+    attrs.iter()
+        .enumerate()
+        .map(|(i, attr)| AttributeSnapshot {
+            type_: attr.type_,
+            len: attr.ul_value_len,
+            value: values.get(i).cloned().unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn bind_count(step: &Step, state: &mut State, count: CK_ULONG) {
@@ -660,7 +1171,6 @@ fn bind_object_vars(state: &mut State) {
 fn children<'a>(step: &'a Step, name: &str) -> Vec<&'a Element> { step.elements.iter().filter(|e| e.name == name).collect() }
 fn child<'a>(step: &'a Step, name: &str) -> Option<&'a Element> { step.elements.iter().find(|e| e.name == name) }
 fn child_value(step: &Step, name: &str) -> Option<String> { child(step, name).and_then(|e| e.attrs.get("value").cloned()) }
-fn attr_u8(element: &Element, name: &str, default: u8) -> Result<u8, String> { Ok(element.attrs.get(name).map(|s| s.parse::<u8>()).transpose().map_err(|err| err.to_string())?.unwrap_or(default)) }
 
 fn resolve_value(value: &str, state: &State) -> String {
     if let Some(resolved) = state.vars.get(value) {
