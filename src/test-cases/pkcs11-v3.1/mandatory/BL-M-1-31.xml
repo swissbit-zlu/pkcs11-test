@@ -53,7 +53,7 @@
   </C_GetTokenInfo>
   <C_GetTokenInfo rv="OK">
     <!-- PIV tokens commonly use a 6-8 digit PIN and may not expose CKF_RNG or CKF_RESTORE_KEY_NOT_NEEDED. -->
-    <Info MaxSessionCount="0" SessionCount="0" MaxRwSessionCount="0" RwSessionCount="0" MaxPinLen="8" MinPinLen="6" TotalPublicMemory="0" FreePublicMemory="0" TotalPrivateMemory="0" FreePrivateMemory="0">
+    <Info MaxSessionCount="64" SessionCount="0" MaxRwSessionCount="64" RwSessionCount="0" MaxPinLen="8" MinPinLen="6" TotalPublicMemory="0" FreePublicMemory="0" TotalPrivateMemory="0" FreePrivateMemory="0">
       <label value="token1                          "/>
       <ManufacturerID value="OASIS PKCS#11 TC                "/>
       <model value="v3.1            "/>
